@@ -238,7 +238,11 @@ def main():
         st.subheader("사진 배치")
         st.caption("아래 그리드를 직접 눌러 셀을 선택/해제하세요. 이 그리드가 미리보기와 셀 선택창을 겸합니다.")
         preview = compose_preview()
-        click = streamlit_image_coordinates(preview, key="interactive_photo_grid")
+        click = streamlit_image_coordinates(
+            preview,
+            key="interactive_photo_grid",
+            use_column_width="always",
+        )
         if click and click.get("unix_time") != st.session_state.get("last_grid_click"):
             st.session_state.last_grid_click = click.get("unix_time")
             iw = max(1, int(click.get("width") or preview.width))

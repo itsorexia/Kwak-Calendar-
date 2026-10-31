@@ -1,6 +1,6 @@
 # Photo Grid Designer
 
-A Streamlit app for arranging photos on a 7 × 5 grid and exporting a 6 × 4 inch print at 600 DPI.
+A Streamlit app for arranging photos on an interactive 7 × 5 grid and exporting a 6 × 4 inch print at 600 DPI. Click cells directly in the preview to select them.
 
 ## Deploy on Streamlit Community Cloud
 

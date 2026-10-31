@@ -1,3 +1,4 @@
 streamlit>=1.40,<2
 Pillow>=10,<13
 pillow-heif>=0.18,<2
+streamlit-image-coordinates==0.4.1

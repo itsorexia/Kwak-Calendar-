@@ -1,6 +1,6 @@
 """Streamlit port of the 7 x 5 Photo Grid Designer.
 
-Run locally with: streamlit run photo_grid_streamlit.py
+Run locally with: streamlit run app.py
 Optional HEIC support: pip install pillow-heif
 """
 from __future__ import annotations
@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 import streamlit as st
+from streamlit_image_coordinates import streamlit_image_coordinates
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 ROWS, COLS = 5, 7
@@ -157,7 +158,10 @@ def compose_preview():
             except Exception: d.text((x1+4,y1+4), "이미지 오류", fill="red")
         if rg.text:
             layer = text_layer(rg.text, x2-x1, y2-y1, bool(rg.image_data)); out_rgba=out.convert("RGBA"); out_rgba.alpha_composite(layer, (x1,y1)); out=out_rgba.convert("RGB"); d=ImageDraw.Draw(out)
-        if not rg.image_data and not rg.text: d.text(((x1+x2)//2-20,(y1+y2)//2-7), "사진 없음", fill="#8BA4D6")
+        if not rg.image_data and not rg.text:
+            label = f"{rg.row+1}-{rg.col+1}"
+            box = d.textbbox((0, 0), label)
+            d.text(((x1+x2-(box[2]-box[0]))//2, (y1+y2-(box[3]-box[1]))//2), label, fill="#8BA4D6")
     return out
 
 
@@ -232,15 +236,21 @@ def main():
     left,right=st.columns([1.45,1],gap="large")
     with left:
         st.subheader("사진 배치")
-        st.caption("셀을 눌러 선택/해제하세요. 여러 셀을 선택하면 합치기·변환·삭제를 적용할 수 있습니다.")
-        for r in range(ROWS):
-            cols=st.columns(COLS,gap="small")
-            for c in range(COLS):
-                rid=st.session_state.lookup[(r,c)]; rg=st.session_state.regions[rid]
-                mark="🟨 " if (r,c) in st.session_state.selected else ""
-                icon="📷" if rg.image_data else ("✍️" if rg.text else "＋")
-                if cols[c].button(f"{mark}{icon}\n{r+1}-{c+1}",key=f"cell_{r}_{c}",use_container_width=True): select_cell(r,c); st.rerun()
-        st.image(compose_preview(),caption="미리보기 · 셀 병합/선택 상태 반영",use_container_width=True)
+        st.caption("아래 그리드를 직접 눌러 셀을 선택/해제하세요. 이 그리드가 미리보기와 셀 선택창을 겸합니다.")
+        preview = compose_preview()
+        click = streamlit_image_coordinates(preview, key="interactive_photo_grid")
+        if click and click.get("unix_time") != st.session_state.get("last_grid_click"):
+            st.session_state.last_grid_click = click.get("unix_time")
+            iw = max(1, int(click.get("width") or preview.width))
+            ih = max(1, int(click.get("height") or preview.height))
+            px = click["x"] * preview.width / iw
+            py = click["y"] * preview.height / ih
+            cell, origin = 105, 10
+            if origin <= px < origin + COLS * cell and origin <= py < origin + ROWS * cell:
+                col = int((px - origin) // cell)
+                row = int((py - origin) // cell)
+                select_cell(row, col)
+                st.rerun()
 
     with right:
         st.subheader("편집")

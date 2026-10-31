@@ -37,6 +37,7 @@ class Region:
     flip_v: bool = False
     image_offset_x: float = 0.0
     image_offset_y: float = 0.0
+    crop_box: list[float] | None = None
 
     def cells(self):
         return {(r, c) for r in range(self.row, self.row + self.rowspan) for c in range(self.col, self.col + self.colspan)}
@@ -93,17 +94,37 @@ def decode_image(region: Region) -> Image.Image | None:
 
 
 def render_photo(region: Region, size: tuple[int, int], mode=None, offsets=None):
-    im = decode_image(region)
-    if im is None: return None
     mode = mode or st.session_state.fit
     ox, oy = offsets or (region.image_offset_x, region.image_offset_y)
+    if "_photo_render_cache" not in st.session_state:
+        st.session_state["_photo_render_cache"] = {}
+    cache = st.session_state["_photo_render_cache"]
+    image_key = (hash(region.image_data), len(region.image_data))
+    key = (image_key, region.image_name, region.rotation, region.flip_h, region.flip_v,
+           tuple(size), mode, bg_rgb(), round(float(ox), 5), round(float(oy), 5),
+           tuple(region.crop_box) if region.crop_box else None)
+    if key in cache:
+        return cache[key]
+    im = decode_image(region)
+    if im is None: return None
     if mode == "contain":
         fitted = ImageOps.contain(im, size, method=Image.Resampling.LANCZOS)
         out = Image.new("RGB", size, bg_rgb())
         x = round(max(0, size[0] - fitted.width) * (ox + 1) / 2)
         y = round(max(0, size[1] - fitted.height) * (oy + 1) / 2)
-        out.paste(fitted, (x, y)); return out
-    return ImageOps.fit(im, size, method=Image.Resampling.LANCZOS, centering=((ox + 1) / 2, (oy + 1) / 2))
+        out.paste(fitted, (x, y))
+    else:
+        out = ImageOps.fit(im, size, method=Image.Resampling.LANCZOS, centering=((ox + 1) / 2, (oy + 1) / 2))
+    if region.crop_box:
+        left, top, right, bottom = [max(0.0, min(1.0, float(v))) for v in region.crop_box]
+        x1, y1 = int(left * size[0]), int(top * size[1])
+        x2, y2 = int(right * size[0]), int(bottom * size[1])
+        if x2 > x1 and y2 > y1:
+            out = out.crop((x1, y1, x2, y2)).resize(size, Image.Resampling.LANCZOS)
+    if len(cache) >= 120:
+        cache.pop(next(iter(cache)))
+    cache[key] = out
+    return out
 
 
 def font(size: int):
@@ -195,6 +216,15 @@ def select_cell(r, c):
     else: st.session_state.selected |= rg.cells()
 
 
+def select_rectangle(r0, c0, r1, c1):
+    selected = set()
+    for r in range(min(r0, r1), max(r0, r1) + 1):
+        for c in range(min(c0, c1), max(c0, c1) + 1):
+            rid = st.session_state.lookup[(r, c)]
+            selected.update(st.session_state.regions[rid].cells())
+    st.session_state.selected = selected
+
+
 def move_photo_by_drag(region: Region, dx: float, dy: float, cell_size: int = 105):
     """Pan the photo under the pointer, using the same normalized offsets as export."""
     source = decode_image(region)
@@ -236,7 +266,8 @@ def load_project(data):
             if (r,c) not in lookup:
                 rid=f"r{r}c{c}"; regs[rid]=Region(rid,r,c); lookup[(r,c)]=rid
     st.session_state.regions,st.session_state.lookup=regs,lookup
-    st.session_state.selected=set(); st.session_state.fit=obj.get("fit_mode","cover"); st.session_state.bg=obj.get("photo_bg_mode","sky")
+    st.session_state.selected=set(); st.session_state.crop_mode_region_id=None; st.session_state.last_grid_tap=None
+    st.session_state.fit=obj.get("fit_mode","cover"); st.session_state.bg=obj.get("photo_bg_mode","sky")
     st.session_state.text_size=max(20,min(260,int(obj.get("text_size",obj.get("photo_text_size",100)))))
     st.session_state.text_alpha=max(40,min(255,int(obj.get("photo_text_alpha",150))))
 
@@ -252,7 +283,8 @@ def main():
         a,b=st.columns([1,2])
         with a:
             if st.button("새 프로젝트", use_container_width=True):
-                st.session_state.regions,st.session_state.lookup=fresh_regions(); st.session_state.selected=set(); st.rerun()
+                st.session_state.regions,st.session_state.lookup=fresh_regions(); st.session_state.selected=set()
+                st.session_state.crop_mode_region_id=None; st.session_state.last_grid_tap=None; st.rerun()
             st.download_button("프로젝트 JSON 저장",save_project(),"photo_grid_project.json","application/json",use_container_width=True)
         with b:
             up=st.file_uploader("프로젝트 JSON 열기",type=["json"],key="project_upload")
@@ -263,7 +295,7 @@ def main():
     left,right=st.columns([1.45,1],gap="large")
     with left:
         st.subheader("사진 배치")
-        st.caption("셀을 클릭해 선택하고, 사진을 드래그해 위치를 조정하세요.")
+        st.caption("셀 클릭: 선택 · 셀을 가로질러 드래그: 범위 선택 · 사진 셀 안에서 드래그: 사진 이동 · 사진 더블클릭: 자르기")
         preview = compose_preview()
         click = streamlit_image_coordinates(
             preview,
@@ -288,17 +320,81 @@ def main():
                 col = int((px - origin) // cell)
                 row = int((py - origin) // cell)
                 rg = st.session_state.regions[st.session_state.lookup[(row, col)]]
-                if abs(dx) + abs(dy) > 3 and rg.image_data:
-                    try:
-                        move_photo_by_drag(rg, dx, dy)
-                    except Exception as exc:
-                        st.error(f"사진 위치를 바꾸지 못했습니다: {exc}")
-                    st.session_state.selected = rg.cells()
-                elif abs(dx) + abs(dy) <= 3:
-                    select_cell(row, col)
+                is_drag = abs(dx) + abs(dy) > 3
+                crop_mode_id = st.session_state.get("crop_mode_region_id")
+                if crop_mode_id:
+                    crop_region = st.session_state.regions.get(crop_mode_id)
+                    if is_drag and crop_region and rg.id == crop_region.id and crop_region.image_data:
+                        crop_x1 = origin + crop_region.col * cell + 3
+                        crop_y1 = origin + crop_region.row * cell + 3
+                        crop_x2 = origin + (crop_region.col + crop_region.colspan) * cell - 3
+                        crop_y2 = origin + (crop_region.row + crop_region.rowspan) * cell - 3
+                        drag_x2 = px + dx
+                        drag_y2 = py + dy
+                        left = max(crop_x1, min(px, drag_x2))
+                        top = max(crop_y1, min(py, drag_y2))
+                        right = min(crop_x2, max(px, drag_x2))
+                        bottom = min(crop_y2, max(py, drag_y2))
+                        if right - left >= 5 and bottom - top >= 5:
+                            new_box = ((left - crop_x1) / (crop_x2 - crop_x1),
+                                       (top - crop_y1) / (crop_y2 - crop_y1),
+                                       (right - crop_x1) / (crop_x2 - crop_x1),
+                                       (bottom - crop_y1) / (crop_y2 - crop_y1))
+                            old_box = crop_region.crop_box or [0.0, 0.0, 1.0, 1.0]
+                            crop_region.crop_box = [
+                                old_box[0] + (old_box[2] - old_box[0]) * new_box[0],
+                                old_box[1] + (old_box[3] - old_box[1]) * new_box[1],
+                                old_box[0] + (old_box[2] - old_box[0]) * new_box[2],
+                                old_box[1] + (old_box[3] - old_box[1]) * new_box[3],
+                            ]
+                            st.session_state.crop_mode_region_id = None
+                            st.session_state.selected = crop_region.cells()
+                    st.rerun()
+                elif is_drag:
+                    end_px, end_py = px + dx, py + dy
+                    inside_grid = (origin <= end_px < origin + COLS * cell and
+                                   origin <= end_py < origin + ROWS * cell)
+                    if inside_grid:
+                        end_col = int((end_px - origin) // cell)
+                        end_row = int((end_py - origin) // cell)
+                    else:
+                        end_row, end_col = row, col
+                    if (end_row, end_col) != (row, col):
+                        select_rectangle(row, col, end_row, end_col)
+                    elif rg.image_data:
+                        try:
+                            move_photo_by_drag(rg, dx, dy)
+                        except Exception as exc:
+                            st.error(f"사진 위치를 바꾸지 못했습니다: {exc}")
+                        st.session_state.selected = rg.cells()
+                    else:
+                        st.session_state.selected = rg.cells()
                 else:
-                    st.session_state.selected = rg.cells()
+                    event_time = float(click.get("unix_time") or 0)
+                    previous = st.session_state.get("last_grid_tap")
+                    elapsed = event_time - previous[0] if previous else float("inf")
+                    if elapsed > 10:
+                        elapsed /= 1000.0
+                    is_double = (not is_drag and previous and previous[1] == rg.id and 0 <= elapsed <= 0.65)
+                    if is_double and rg.image_data:
+                        st.session_state.crop_mode_region_id = rg.id
+                        st.session_state.selected = rg.cells()
+                        st.session_state.last_grid_tap = None
+                    elif is_drag:
+                        st.session_state.selected = rg.cells()
+                    else:
+                        st.session_state.last_grid_tap = (event_time, rg.id)
+                        select_cell(row, col)
                 st.rerun()
+
+        crop_mode_id = st.session_state.get("crop_mode_region_id")
+        if crop_mode_id:
+            crop_region = st.session_state.regions.get(crop_mode_id)
+            if crop_region:
+                st.info(f"{crop_region.row+1}행 {crop_region.col+1}열 사진 자르기: 미리보기에서 남길 영역을 드래그하세요.")
+                if st.button("자르기 취소", key="cancel_crop_mode"):
+                    st.session_state.crop_mode_region_id = None
+                    st.rerun()
 
     with right:
         st.subheader("편집")
@@ -317,7 +413,7 @@ def main():
                 for i,f in enumerate(files):
                     if i>=len(cells): break
                     rg=regs[st.session_state.lookup[cells[i]]]; rg.image_data=base64.b64encode(f.getvalue()).decode(); rg.image_name=f.name
-                    rg.rotation=0; rg.flip_h=rg.flip_v=False; rg.image_offset_x=rg.image_offset_y=0
+                    rg.rotation=0; rg.flip_h=rg.flip_v=False; rg.image_offset_x=rg.image_offset_y=0; rg.crop_box=None
                 st.rerun()
             text=st.text_area("셀 글씨",value=target.text,key=f"text_edit_{target.id}",height=80)
             if st.button("글씨 적용",use_container_width=True):
@@ -348,7 +444,10 @@ def main():
                     target.image_offset_y=st.slider("세로 중심",-100,100,int(target.image_offset_y*100),key=f"oy_{target.id}")/100
                     if st.button("사진 원위치",key="reset_transform"):
                         for rid in chosen:
-                            regs[rid].rotation=0; regs[rid].flip_h=regs[rid].flip_v=False; regs[rid].image_offset_x=regs[rid].image_offset_y=0
+                            regs[rid].rotation=0; regs[rid].flip_h=regs[rid].flip_v=False; regs[rid].image_offset_x=regs[rid].image_offset_y=0; regs[rid].crop_box=None
+                        st.rerun()
+                    if target.crop_box and st.button("자르기 초기화", key=f"reset_crop_{target.id}"):
+                        for rid in chosen: regs[rid].crop_box=None
                         st.rerun()
             m1,m2,m3=st.columns(3)
             with m1:
@@ -359,7 +458,7 @@ def main():
                     else:
                         old=chosen; first=regs[old[0]] if old else None; nr=Region(f"m{uuid.uuid4().hex[:8]}",min(rs),min(cs),max(rs)-min(rs)+1,max(cs)-min(cs)+1)
                         if first:
-                            for key in ("image_data","image_name","text","rotation","flip_h","flip_v","image_offset_x","image_offset_y"): setattr(nr,key,getattr(first,key))
+                            for key in ("image_data","image_name","text","rotation","flip_h","flip_v","image_offset_x","image_offset_y","crop_box"): setattr(nr,key,getattr(first,key))
                         for rid in old: regs.pop(rid,None)
                         regs[nr.id]=nr
                         for cell in rect: st.session_state.lookup[cell]=nr.id
@@ -377,7 +476,7 @@ def main():
             with m3:
                 if st.button("선택 삭제",use_container_width=True):
                     for rid in chosen:
-                        regs[rid].image_data=""; regs[rid].image_name=""; regs[rid].text=""; regs[rid].rotation=0; regs[rid].flip_h=regs[rid].flip_v=False; regs[rid].image_offset_x=regs[rid].image_offset_y=0
+                        regs[rid].image_data=""; regs[rid].image_name=""; regs[rid].text=""; regs[rid].rotation=0; regs[rid].flip_h=regs[rid].flip_v=False; regs[rid].image_offset_x=regs[rid].image_offset_y=0; regs[rid].crop_box=None
                     st.rerun()
             if st.button("선택 해제",use_container_width=True): st.session_state.selected=set(); st.rerun()
             photo_regions=[regs[rid] for rid in chosen if regs[rid].image_data]
@@ -388,16 +487,46 @@ def main():
                 destination=st.selectbox("도착 셀",[f"{r+1}행 {c+1}열" for r in range(ROWS) for c in range(COLS)],key="move_dst")
                 if st.button("이동 / 사진 교환"):
                     src=regs[names[src_label]]; rr,cc=map(lambda x:int(x)-1,destination.replace("행 ","|").replace("열","").split("|")); dst=regs[st.session_state.lookup[(rr,cc)]]
-                    attrs=("image_data","image_name","rotation","flip_h","flip_v","image_offset_x","image_offset_y")
+                    attrs=("image_data","image_name","rotation","flip_h","flip_v","image_offset_x","image_offset_y","crop_box")
                     a={k:getattr(src,k) for k in attrs}; b={k:getattr(dst,k) for k in attrs}
                     for k in attrs: setattr(src,k,b[k]); setattr(dst,k,a[k])
                     st.session_state.selected=dst.cells(); st.rerun()
 
         st.divider(); st.subheader("내보내기")
-        png=render_print(); buf=io.BytesIO(); png.save(buf,format="PNG",dpi=(DPI,DPI))
-        st.download_button("PNG 다운로드 · 3600 × 2400 px · 600 DPI",buf.getvalue(),"photo_grid_4x6_600dpi.png","image/png",use_container_width=True)
-        pdfbuf=io.BytesIO(); png.save(pdfbuf,format="PDF",resolution=DPI)
-        st.download_button("PDF 다운로드 / 인쇄",pdfbuf.getvalue(),"photo_grid_4x6_600dpi.pdf","application/pdf",use_container_width=True)
+        print_signature = (
+            st.session_state.fit, st.session_state.bg,
+            st.session_state.text_size, st.session_state.text_alpha,
+            tuple((rg.id, rg.row, rg.col, rg.rowspan, rg.colspan, rg.image_data, rg.image_name,
+                   rg.text, rg.rotation, rg.flip_h, rg.flip_v, rg.image_offset_x,
+                   rg.image_offset_y, tuple(rg.crop_box) if rg.crop_box else None)
+                  for rg in sorted(regs.values(), key=lambda item: item.id)),
+        )
+        for cache_name in ("print_png_cache", "print_pdf_cache"):
+            old_cache = st.session_state.get(cache_name)
+            if old_cache and old_cache[0] != print_signature:
+                st.session_state.pop(cache_name, None)
+        png_col, pdf_col = st.columns(2)
+        with png_col:
+            if st.button("PNG 만들기", key="make_print_png", use_container_width=True):
+                with st.spinner("600 DPI PNG를 만드는 중…"):
+                    page = render_print(); buf = io.BytesIO(); page.save(buf, format="PNG", dpi=(DPI, DPI))
+                    st.session_state.print_png_cache = (print_signature, buf.getvalue())
+            png_result = st.session_state.get("print_png_cache")
+            if png_result and png_result[0] == print_signature:
+                st.download_button("PNG 다운로드 · 600 DPI", png_result[1], "photo_grid_4x6_600dpi.png", "image/png", use_container_width=True)
+        with pdf_col:
+            if st.button("PDF 만들기", key="make_print_pdf", use_container_width=True):
+                with st.spinner("600 DPI PDF를 만드는 중…"):
+                    png_result = st.session_state.get("print_png_cache")
+                    if png_result and png_result[0] == print_signature:
+                        page = Image.open(io.BytesIO(png_result[1])).convert("RGB")
+                    else:
+                        page = render_print()
+                    pdfbuf = io.BytesIO(); page.save(pdfbuf, format="PDF", resolution=DPI)
+                    st.session_state.print_pdf_cache = (print_signature, pdfbuf.getvalue())
+            pdf_result = st.session_state.get("print_pdf_cache")
+            if pdf_result and pdf_result[0] == print_signature:
+                st.download_button("PDF 다운로드 / 인쇄", pdf_result[1], "photo_grid_4x6_600dpi.pdf", "application/pdf", use_container_width=True)
         st.caption("PDF를 열어 인쇄할 때 실제 크기(100%)로 출력하세요.")
 
 

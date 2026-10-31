@@ -195,6 +195,33 @@ def select_cell(r, c):
     else: st.session_state.selected |= rg.cells()
 
 
+def move_photo_by_drag(region: Region, dx: float, dy: float, cell_size: int = 105):
+    """Pan the photo under the pointer, using the same normalized offsets as export."""
+    source = decode_image(region)
+    if source is None:
+        return
+    pad = 3
+    target_w = max(1, region.colspan * cell_size - 2 * pad)
+    target_h = max(1, region.rowspan * cell_size - 2 * pad)
+    if st.session_state.fit == "cover":
+        scale = max(target_w / source.width, target_h / source.height)
+        overflow_x = max(0.0, source.width * scale - target_w)
+        overflow_y = max(0.0, source.height * scale - target_h)
+        # Dragging the visible photo right means shifting the crop window left.
+        if overflow_x > 0.5:
+            region.image_offset_x = max(-1.0, min(1.0, region.image_offset_x - 2 * dx / overflow_x))
+        if overflow_y > 0.5:
+            region.image_offset_y = max(-1.0, min(1.0, region.image_offset_y - 2 * dy / overflow_y))
+    else:
+        scale = min(target_w / source.width, target_h / source.height)
+        spare_x = max(0.0, target_w - source.width * scale)
+        spare_y = max(0.0, target_h - source.height * scale)
+        if spare_x > 0.5:
+            region.image_offset_x = max(-1.0, min(1.0, region.image_offset_x + 2 * dx / spare_x))
+        if spare_y > 0.5:
+            region.image_offset_y = max(-1.0, min(1.0, region.image_offset_y + 2 * dy / spare_y))
+
+
 def save_project():
     return json.dumps({"rows":ROWS,"cols":COLS,"fit_mode":st.session_state.fit,"photo_bg_mode":st.session_state.bg,"text_size":st.session_state.text_size,"photo_text_alpha":st.session_state.text_alpha,"regions":[asdict(x) for x in st.session_state.regions.values()]},ensure_ascii=False,indent=2).encode()
 
@@ -236,24 +263,41 @@ def main():
     left,right=st.columns([1.45,1],gap="large")
     with left:
         st.subheader("사진 배치")
-        st.caption("아래 그리드를 직접 눌러 셀을 선택/해제하세요. 이 그리드가 미리보기와 셀 선택창을 겸합니다.")
+        st.caption("셀을 클릭해 선택하고, 사진을 드래그해 위치를 조정하세요.")
         preview = compose_preview()
         click = streamlit_image_coordinates(
             preview,
             key="interactive_photo_grid",
             use_column_width="always",
+            click_and_drag=True,
         )
         if click and click.get("unix_time") != st.session_state.get("last_grid_click"):
             st.session_state.last_grid_click = click.get("unix_time")
             iw = max(1, int(click.get("width") or preview.width))
             ih = max(1, int(click.get("height") or preview.height))
-            px = click["x"] * preview.width / iw
-            py = click["y"] * preview.height / ih
+            start_x = float(click.get("x1", click.get("x", 0)))
+            start_y = float(click.get("y1", click.get("y", 0)))
+            end_x = float(click.get("x2", start_x))
+            end_y = float(click.get("y2", start_y))
+            px = start_x * preview.width / iw
+            py = start_y * preview.height / ih
+            dx = (end_x - start_x) * preview.width / iw
+            dy = (end_y - start_y) * preview.height / ih
             cell, origin = 105, 10
             if origin <= px < origin + COLS * cell and origin <= py < origin + ROWS * cell:
                 col = int((px - origin) // cell)
                 row = int((py - origin) // cell)
-                select_cell(row, col)
+                rg = st.session_state.regions[st.session_state.lookup[(row, col)]]
+                if abs(dx) + abs(dy) > 3 and rg.image_data:
+                    try:
+                        move_photo_by_drag(rg, dx, dy)
+                    except Exception as exc:
+                        st.error(f"사진 위치를 바꾸지 못했습니다: {exc}")
+                    st.session_state.selected = rg.cells()
+                elif abs(dx) + abs(dy) <= 3:
+                    select_cell(row, col)
+                else:
+                    st.session_state.selected = rg.cells()
                 st.rerun()
 
     with right:
